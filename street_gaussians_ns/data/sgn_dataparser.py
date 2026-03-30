@@ -261,7 +261,8 @@ class ColmapDataParser(DataParser):
                 _, counts = torch.unique(camera_ids, return_counts=True)
                 frame_len = counts[0]
                 all_idx_list = []
-                for i in range(len(self.config.filter_camera_id)):
+                num_cameras = len(self.config.filter_camera_id) if self.config.filter_camera_id is not None else len(counts)
+                for i in range(num_cameras):
                     start_frame = self.config.frame_select[0] + i * frame_len
                     end_frame = self.config.frame_select[1] + i * frame_len
                     all_idx_list.extend(range(start_frame, end_frame))

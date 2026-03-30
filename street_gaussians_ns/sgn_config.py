@@ -36,7 +36,8 @@ street_gaussians_ns_method = MethodSpecification(
                     undistort=True,
                     colmap_path=Path("colmap/sparse/0"),
                     segments_path=Path("segs"),
-                    load_dynamic_annotations=True,
+                    init_points_filename="points3D.txt",
+                    load_dynamic_annotations=False,
                 ),
             ),
             model=SplatfactoSceneGraphModelConfig(
