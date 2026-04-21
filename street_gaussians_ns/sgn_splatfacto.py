@@ -981,8 +981,7 @@ class SplatfactoModel(Model):
         else:
             rgbs = torch.sigmoid(colors[:, 0, :])
 
-        if self.num_tiles_hit.sum() == 0:
-            # assert (self.num_tiles_hit > 0).any()  # type: ignore
+        if num_tiles_hit.sum() == 0:
             # No tiles hit, return transparent background
             # Ensure gradients can flow (even if zero) to avoid "element 0 of tensors does not require grad"
             dummy_grad = self.means.sum() * 0.0 + self.scales.sum() * 0.0 + self.quats.sum() * 0.0

@@ -361,9 +361,11 @@ class SplatfactoSceneGraphModel(SplatfactoModel):
         assert self.crop_box is None or self.training, "crop_box is not supported for scene graph model now"
         # forward like the original model
         out = super().get_outputs(camera)
-        out['object_acc'] = (self.get_submodel_output(camera, [submodel_name for submodel_name in self.visible_model_names if submodel_name.startswith("object")],
-                                                       object_means=object_means, object_features_dc=object_features_dc, output_names=['accumulation']))['accumulation']
-        out['background_acc'] = (self.get_submodel_output(camera, ["background"], output_names=['accumulation']))['accumulation']
+        # Only compute separate sub-model accumulations when needed (saves 2 extra rasterization passes)
+        if not self.training or (self.config.object_acc_entropy_loss_mult > 0. and self.step > self.config.background_model.stop_split_at):
+            out['object_acc'] = (self.get_submodel_output(camera, [submodel_name for submodel_name in self.visible_model_names if submodel_name.startswith("object")],
+                                                           object_means=object_means, object_features_dc=object_features_dc, output_names=['accumulation']))['accumulation']
+            out['background_acc'] = (self.get_submodel_output(camera, ["background"], output_names=['accumulation']))['accumulation']
         if not self.training:
             with torch.no_grad():
                 background_output = self.get_submodel_output(camera, ["background"], sky_capture=out.get("sky", None), output_names=['rgb'])
@@ -383,7 +385,7 @@ class SplatfactoSceneGraphModel(SplatfactoModel):
         """
         losses = super().get_loss_dict(outputs, batch, metrics_dict)
 
-        if self.config.object_acc_entropy_loss_mult > 0. and self.step > self.config.background_model.stop_split_at:
+        if self.config.object_acc_entropy_loss_mult > 0. and self.step > self.config.background_model.stop_split_at and 'object_acc' in outputs:
             object_acc = torch.clamp(outputs['object_acc'], min=1e-5, max=1-1e-5)
             losses['object_acc_entropy_loss'] = self.config.object_acc_entropy_loss_mult * \
             -(object_acc*torch.log(object_acc) + (1. - object_acc)*torch.log(1. - object_acc)).mean()
