@@ -353,14 +353,23 @@ class InterpolatedAnnotation:
         pcd = o3d.io.read_point_cloud(str(ply_path))
         # read points_xyz
         points3D = torch.from_numpy(np.array(pcd.points, dtype=np.float32))
-        if points3D.shape[0] < 10000:
+        if points3D.shape[0] < 100:
             return None
-        points3D *= self.scale_factor
         # Load point colours
         if pcd.has_colors():
             points3D_rgb = torch.from_numpy(np.array(pcd.colors, dtype=np.float32)).float() * 255.
         else:
             points3D_rgb = torch.rand(points3D.shape[0], 3, dtype=torch.float32) * 255.
+        # Subsample to avoid extremely dense point clouds that produce tiny
+        # initial gaussian scales (sub-pixel), which prevents any gradient
+        # signal during training.
+        max_seed_pts = 2000
+        if points3D.shape[0] > max_seed_pts:
+            indices = torch.randperm(points3D.shape[0])[:max_seed_pts]
+            points3D = points3D[indices]
+            points3D_rgb = points3D_rgb[indices]
+            CONSOLE.log(f"Subsampled object_{trackId} to {max_seed_pts} seed points.")
+        points3D *= self.scale_factor
             
         return (points3D, points3D_rgb)
 
