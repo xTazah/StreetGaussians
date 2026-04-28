@@ -10,7 +10,7 @@ from pathlib import Path
 
 if len(sys.argv) < 2:
     # try to auto-find the config
-    output_dir = Path("outputs/output_002_v2/street-gaussians-ns")
+    output_dir = Path("outputs/output_seg10243_v1/street-gaussians-ns")
     if output_dir.exists():
         subdirs = sorted([d for d in output_dir.iterdir() if d.is_dir()])
         if subdirs:

@@ -444,13 +444,10 @@ class ColmapDataParser(DataParser):
             # Load 3D points
             metadata.update(self._load_3D_points(colmap_path, transform_matrix, scale_factor))
         if self.config.load_dynamic_annotations:
-            translation = meta["applied_translation_in_colmap"]
-            translation = gl2cv(np.append(translation, 1))
-            # get 4x4 matrix
-            transform_matrix_colmap = np.eye(4)
-            transform_matrix_colmap[:3,3] = translation[:3]
-            # Load dynamic annotations
-            transform_matrix_anno = transform_matrix.numpy() @ transform_matrix_colmap
+            # Use the same transform as background points (no extra colmap
+            # translation — our data wasn't produced by real COLMAP).
+            transform_matrix_anno = np.eye(4)
+            transform_matrix_anno[:3, :] = transform_matrix.numpy()
             metadata.update({"object_annos":InterpolatedAnnotation(
                 anno_json_path=self.config.data / 'annotation.json',
                 lidar_path=self.config.data / 'aggregate_lidar' / 'dynamic_objects',

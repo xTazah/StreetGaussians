@@ -31,4 +31,7 @@ if __name__ == "__main__":
         assert k + offset not in colmap_points1
         colmap_points1[k + offset] = v._replace(id=k + offset)
 
-    colmap_utils.write_points3D_binary(colmap_points1, args.dst)
+    if args.dst.suffix == ".bin":
+        colmap_utils.write_points3D_binary(colmap_points1, args.dst)
+    else:
+    	colmap_utils.write_points3D_text(colmap_points1, args.dst)

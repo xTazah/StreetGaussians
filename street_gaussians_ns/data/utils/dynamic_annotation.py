@@ -368,7 +368,7 @@ class InterpolatedAnnotation:
             indices = torch.randperm(points3D.shape[0])[:max_seed_pts]
             points3D = points3D[indices]
             points3D_rgb = points3D_rgb[indices]
-            CONSOLE.log(f"Subsampled object_{trackId} to {max_seed_pts} seed points.")
+            #CONSOLE.log(f"Subsampled object_{trackId} to {max_seed_pts} seed points.")
         points3D *= self.scale_factor
             
         return (points3D, points3D_rgb)
