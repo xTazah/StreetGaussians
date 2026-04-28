@@ -110,7 +110,7 @@ class WaymoDataExtractor:
 
         for frame_idx, data in enumerate(dataset):
             frame = dataset_pb2.Frame()
-            frame.ParseFromString(bytearray(data.numpy()))
+            frame.ParseFromString(data.numpy())
 
             if frame_idx == 0:
                 segment_name = frame.context.name

@@ -21,9 +21,9 @@ from street_gaussians_ns.sgn_splatfacto_scene_graph import SplatfactoSceneGraphM
 street_gaussians_ns_method = MethodSpecification(
     config=TrainerConfig(
         method_name="street-gaussians-ns",
-        steps_per_eval_image=5000,
-        steps_per_eval_batch=5000,
-        steps_per_save=1000,
+        steps_per_eval_image=500,
+        steps_per_eval_batch=500,
+        steps_per_save=2000,
         steps_per_eval_all_images=30000, 
         max_num_iterations=30000,
         mixed_precision=False,
@@ -54,7 +54,7 @@ street_gaussians_ns_method = MethodSpecification(
                     warmup_length=500,
                     refine_every=100,
                     reset_alpha_every=30,
-                    stop_split_at=10000,
+                    stop_split_at=25000,
                     fourier_features_dim=1,
                 ),
                 object_model_template=SplatfactoModelConfig(
@@ -64,7 +64,7 @@ street_gaussians_ns_method = MethodSpecification(
                     warmup_length=500,
                     refine_every=100,
                     reset_alpha_every=30,
-                    stop_split_at=10000,
+                    stop_split_at=25000,
                     fourier_features_dim=5,
                     num_random=10000,
                 )
