@@ -31,8 +31,21 @@ except ImportError:
 # Constants matching the codebase
 MIN_MOVING_SPEED = 0.2  # from extract_waymo.py
 EXP_RATE = np.array([1.3, 1.3, 1.1])  # from dynamic_annotation.py
-MIN_POINTS_PER_OBJECT = 10000  # from dynamic_annotation.py load_object_3D_points
-FILTER_LABEL = ["car"]  # from dynamic_annotation.py
+
+# Phase 1 pedestrian extension: class-aware min points threshold.
+# Pedestrians at typical Waymo distances (10-30m) have ~30-80 LiDAR returns per
+# frame; aggregated across visible frames they yield 150-2000 points. The 20-point
+# floor catches truly garbage tracks (one-frame false positives) without dropping
+# real pedestrians. Vehicles keep the original 10000 floor.
+MIN_POINTS_PER_CLASS = {
+    "car": 10000,
+    "pedestrian": 20,
+}
+DEFAULT_MIN_POINTS = 10000  # Phase 1 pedestrian extension: fallback for unknown classes
+
+# Phase 1 pedestrian extension: admit pedestrians through the PLY-extraction
+# pipeline. Cyclists are intentionally out of scope for Phase 1.
+FILTER_LABEL = ["car", "pedestrian"]
 
 # Mapping from track_info.txt class names to annotation.json type names
 # (matching extract_waymo.py _box_type_to_str)
@@ -235,12 +248,15 @@ def extract_object_points(processed_root: Path, world_boxes_by_frame: dict):
     points inside each object's bounding box (expanded by EXP_RATE),
     and transforms them to the object's local coordinate frame.
 
-    Returns dict: gid -> {"xyz": list of (3,) arrays}.
+    Returns (obj_points, obj_types):
+      obj_points: dict gid -> (N,3) array of object-local points
+      obj_types:  dict gid -> object class string (e.g. "car", "pedestrian")
     """
     print("Loading point cloud data...")
     pointcloud = load_pointcloud(processed_root)
 
-    obj_points = defaultdict(list)  # gid -> list of (3,) local points
+    obj_points = defaultdict(list)  # gid -> list of (N_i,3) local-frame point arrays
+    obj_types = {}  # Phase 1 pedestrian extension: track per-gid class for later filtering.
 
     frame_indices = sorted(world_boxes_by_frame.keys())
     total_frames = len(frame_indices)
@@ -250,7 +266,8 @@ def extract_object_points(processed_root: Path, world_boxes_by_frame: dict):
             print(f"  Processing frame {count + 1}/{total_frames}...")
 
         boxes = world_boxes_by_frame[frame_idx]
-        # Filter to only moving objects with types in FILTER_LABEL
+        # Phase 1 pedestrian extension: FILTER_LABEL now includes "pedestrian", so
+        # pedestrian boxes pass through here alongside cars.
         moving_boxes = [
             b for b in boxes
             if b["is_moving"] and b["type"] in FILTER_LABEL
@@ -298,6 +315,7 @@ def extract_object_points(processed_root: Path, world_boxes_by_frame: dict):
             pts_local = (w2o @ pts_homo.T).T[:, :3]
 
             obj_points[box["gid"]].append(pts_local)
+            obj_types[box["gid"]] = box["type"]  # Phase 1 pedestrian extension
 
     # Concatenate all points per object
     result = {}
@@ -305,20 +323,27 @@ def extract_object_points(processed_root: Path, world_boxes_by_frame: dict):
         all_pts = np.concatenate(pts_list, axis=0)
         result[gid] = all_pts
 
-    return result
+    return result, obj_types
 
 
-def save_ply_files(obj_points: dict, output_root: Path):
-    """Save per-object PLY files. Only saves objects with >= MIN_POINTS_PER_OBJECT points."""
+def save_ply_files(obj_points: dict, obj_types: dict, output_root: Path):
+    """Save per-object PLY files using class-aware minimum-point thresholds.
+
+    Phase 1 pedestrian extension: threshold is now per-class via MIN_POINTS_PER_CLASS,
+    so pedestrians (which never have 10000+ points) are no longer silently dropped.
+    """
     ply_dir = output_root / "aggregate_lidar" / "dynamic_objects"
     ply_dir.mkdir(parents=True, exist_ok=True)
 
     saved = 0
-    skipped = 0
+    skipped_per_class = defaultdict(int)
+    saved_per_class = defaultdict(int)
     for gid, pts in obj_points.items():
-        if pts.shape[0] < MIN_POINTS_PER_OBJECT:
-            print(f"  Skipping {gid}: only {pts.shape[0]} points (need {MIN_POINTS_PER_OBJECT})")
-            skipped += 1
+        obj_type = obj_types.get(gid, "unknown")
+        threshold = MIN_POINTS_PER_CLASS.get(obj_type, DEFAULT_MIN_POINTS)
+        if pts.shape[0] < threshold:
+            print(f"  Skipping {gid} ({obj_type}): only {pts.shape[0]} points (need {threshold})")
+            skipped_per_class[obj_type] += 1
             continue
 
         pcd = o3d.geometry.PointCloud()
@@ -330,9 +355,14 @@ def save_ply_files(obj_points: dict, output_root: Path):
         ply_path = ply_dir / f"{gid}.ply"
         o3d.io.write_point_cloud(str(ply_path), pcd)
         saved += 1
-        print(f"  Saved {ply_path.name}: {pts.shape[0]} points")
+        saved_per_class[obj_type] += 1
+        print(f"  Saved {ply_path.name} ({obj_type}): {pts.shape[0]} points")
 
-    print(f"PLY summary: {saved} saved, {skipped} skipped (< {MIN_POINTS_PER_OBJECT} points)")
+    # Phase 1 pedestrian extension: per-class summary so missing pedestrians are visible.
+    print(f"PLY summary: {saved} saved total")
+    for cls in sorted(set(list(saved_per_class.keys()) + list(skipped_per_class.keys()))):
+        print(f"  {cls}: {saved_per_class[cls]} saved, {skipped_per_class[cls]} skipped "
+              f"(< {MIN_POINTS_PER_CLASS.get(cls, DEFAULT_MIN_POINTS)} points)")
 
 
 def main():
@@ -378,12 +408,18 @@ def main():
     annotation, world_boxes_by_frame = build_annotation_json(processed_root, int_to_gid)
     num_frames = len(annotation["frames"])
     num_objects_total = sum(len(f["objects"]) for f in annotation["frames"])
-    num_moving = sum(
-        1 for f in annotation["frames"]
-        for o in f["objects"]
-        if o["is_moving"] and o["type"] in FILTER_LABEL
-    )
-    print(f"  {num_frames} frames, {num_objects_total} total object entries, {num_moving} moving+filtered entries")
+    # Phase 1 pedestrian extension: report per-class moving+filtered counts so it's
+    # immediately visible whether pedestrians are surviving the upstream Waymo extract.
+    moving_per_class = defaultdict(int)
+    for f in annotation["frames"]:
+        for o in f["objects"]:
+            if o["is_moving"] and o["type"] in FILTER_LABEL:
+                moving_per_class[o["type"]] += 1
+    num_moving = sum(moving_per_class.values())
+    print(f"  {num_frames} frames, {num_objects_total} total object entries, "
+          f"{num_moving} moving+filtered entries")
+    for cls in sorted(moving_per_class.keys()):
+        print(f"    {cls}: {moving_per_class[cls]} moving entries across all frames")
 
     # Save annotation.json
     anno_path = output_root / "annotation.json"
@@ -397,11 +433,12 @@ def main():
             f"pointcloud.npz not found in {processed_root}"
 
         print("Extracting per-object lidar points...")
-        obj_points = extract_object_points(processed_root, world_boxes_by_frame)
+        # Phase 1 pedestrian extension: extractor now returns per-gid type as well.
+        obj_points, obj_types = extract_object_points(processed_root, world_boxes_by_frame)
         print(f"  Extracted points for {len(obj_points)} objects")
 
         print("Saving PLY files...")
-        save_ply_files(obj_points, output_root)
+        save_ply_files(obj_points, obj_types, output_root)
     else:
         print("Skipping PLY extraction (--skip_ply)")
 

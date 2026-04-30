@@ -16,9 +16,17 @@ from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttrib
 from nerfstudio.cameras.camera_utils import quaternion_from_matrix
 from nerfstudio.cameras.cameras import Cameras
 
-from street_gaussians_ns.sgn_splatfacto import SplatfactoModel, SplatfactoModelConfig
+from street_gaussians_ns.sgn_splatfacto import SplatfactoModel, SplatfactoModelConfig, RGB2SH
 from street_gaussians_ns.data.utils.bbox_optimizers import BBoxOptimizerConfig, BBoxOptimizer
 from street_gaussians_ns.data.utils.dynamic_annotation import InterpolatedAnnotation, Box, parse_timestamp
+
+
+# Phase 1 pedestrian extension: classes whose Gaussians get force-painted at
+# eval time so it's visually obvious that pedestrians are placed correctly in
+# the scene graph. Empty list = behavior matches pre-Phase-1 rendering.
+DEBUG_COLOR_BY_CLASS = {
+    'pedestrian': (1.0, 0.0, 0.0),  # red
+}
 
 
 
@@ -36,6 +44,10 @@ class SplatfactoSceneGraphModelConfig(SplatfactoModelConfig):
     """Bounding box optimizer config"""
     object_acc_entropy_loss_mult: float = 0.001
     """loss weight of object-background accumulation cross entropy loss"""
+    debug_pedestrian_color: bool = False
+    """Phase 1 pedestrian extension: at eval time, force-paint pedestrian Gaussians
+    in DEBUG_COLOR_BY_CLASS so they are visually unmistakable in renderings.
+    Has no effect during training (loss-time appearance is unchanged)."""
 
 
 class SplatfactoSceneGraphModel(SplatfactoModel):
@@ -340,7 +352,27 @@ class SplatfactoSceneGraphModel(SplatfactoModel):
                 if exist_frame:
                     self.bbox_optimizer.apply_to_bbox(anno)
                 # add fourier features of time
-                if self.config.fourier_features_dim > 1:
+                # Phase 1 pedestrian extension: at eval time, replace per-Gaussian
+                # SH-DC with a constant color for classes in DEBUG_COLOR_BY_CLASS so
+                # they are visually unmistakable in renderings. We override only the
+                # DC term; features_rest still flows through normal aggregation, which
+                # leaves view-dependent shading visible on top of the debug color but
+                # keeps the change localized and the override cheap.
+                debug_color = (
+                    DEBUG_COLOR_BY_CLASS.get(anno.label)
+                    if (self.config.debug_pedestrian_color and not self.training)
+                    else None
+                )
+                if debug_color is not None:
+                    n_obj = obj_model.num_points
+                    debug_sh = torch.tensor(
+                        [RGB2SH(c) for c in debug_color],
+                        device=self.device, dtype=obj_model.features_dc.dtype,
+                    )  # shape (3,)
+                    object_features_dc.append(
+                        debug_sh.view(1, 1, 3).expand(n_obj, 1, 3).contiguous()
+                    )
+                elif self.config.fourier_features_dim > 1:
                     object_features_dc.append(self.get_fourier_features(anno.frame, trackId, obj_model))
                 else:
                     object_features_dc.append(obj_model.features_dc)

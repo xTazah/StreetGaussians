@@ -16,10 +16,24 @@ from nerfstudio.cameras.camera_utils import quaternion_from_matrix, quaternion_s
 
 # only keep the box with label in FILTER_LABEL, if is None, select all
 # FILTER_LABEL = None
-FILTER_LABEL = ['car']
+# Phase 1 pedestrian extension: admit pedestrians as foreground objects.
+# Cyclists are intentionally out of scope for Phase 1.
+FILTER_LABEL = ['car', 'pedestrian']
 
 # the ratio used to expend 3D bbox
 EXP_RATE = np.array([1.3, 1.3, 1.1])
+
+# Phase 1 pedestrian extension: class-aware floor for points-after-load.
+# Pedestrians at typical Waymo distances will not have hundreds of LiDAR returns;
+# the original 100-point hardcoded floor silently dropped them all. The 10-point
+# floor for pedestrians is just a safety net against degenerate PLYs (any pedestrian
+# that survived MIN_POINTS_PER_CLASS in generate_annotations.py is essentially
+# guaranteed to clear this).
+MIN_POINTS_AFTER_LOAD = {
+    'car': 100,
+    'pedestrian': 10,
+}
+DEFAULT_MIN_POINTS_AFTER_LOAD = 100
 
 COLORMAPS = [
     [1.0, 0.0, 0.0],  # Red
@@ -321,8 +335,18 @@ class InterpolatedAnnotation:
             trackId = obj['gid']
             ply_path = self.lidar_path / f"{trackId}.ply"
             if not ply_path.exists():
+                # Phase 1 pedestrian extension: surface silently-dropped objects.
+                # Annotation entry exists but the preprocess didn't write a PLY
+                # (typically because MIN_POINTS_PER_CLASS in generate_annotations.py
+                # filtered it out). Without this warning the parser would just skip
+                # in silence and the user has no idea why a pedestrian is missing.
+                CONSOLE.log(
+                    f"[yellow]Phase 1 pedestrian extension: {obj['type']} object "
+                    f"{trackId} has no PLY at {ply_path.name}, skipping.[/yellow]"
+                )
                 continue
-            pts = self.load_object_3D_points(trackId)
+            # Phase 1 pedestrian extension: pass obj_type for class-aware threshold.
+            pts = self.load_object_3D_points(trackId, obj_type=obj['type'])
             if pts is None:
                 continue
             rot = quaternion_matrix(quat)[:3, :3]
@@ -336,16 +360,20 @@ class InterpolatedAnnotation:
             # use first box as meta
             if trackId not in self.objects_meta:
                 if self.lidar_path is not None:
-                    pts = self.load_object_3D_points(trackId)
+                    # Phase 1 pedestrian extension: pass obj_type here too.
+                    pts = self.load_object_3D_points(trackId, obj_type=obj['type'])
                     self.seed_pts[trackId] = pts
-                    CONSOLE.log(f"Load object_{trackId} lidar points.")
+                    CONSOLE.log(f"Load object_{trackId} ({obj['type']}) lidar points.")
                 self.objects_meta[trackId] = box
                 self.objects_frames[trackId] = []
             self.objects_frames[trackId].append(frame)
         # return np.array(pts)
         return boxes
 
-    def load_object_3D_points(self, trackId: str):
+    def load_object_3D_points(self, trackId: str, obj_type: str = 'car'):
+        # Phase 1 pedestrian extension: obj_type drives a class-aware floor so
+        # pedestrians (which never have 100+ LiDAR points after subsampling) are
+        # not silently dropped here.
         ply_path = self.lidar_path / f"{trackId}.ply"
         if not ply_path.exists():
             return None
@@ -353,7 +381,9 @@ class InterpolatedAnnotation:
         pcd = o3d.io.read_point_cloud(str(ply_path))
         # read points_xyz
         points3D = torch.from_numpy(np.array(pcd.points, dtype=np.float32))
-        if points3D.shape[0] < 100:
+        min_pts = MIN_POINTS_AFTER_LOAD.get(obj_type, DEFAULT_MIN_POINTS_AFTER_LOAD)
+        if points3D.shape[0] < min_pts:
+            CONSOLE.log(f"[yellow]Phase 1 pedestrian extension: {obj_type} object {trackId} has only "f"{points3D.shape[0]} LiDAR points after loading, below the {min_pts}-point threshold, skipping.[/yellow]")
             return None
         # Load point colours
         if pcd.has_colors():
@@ -363,6 +393,7 @@ class InterpolatedAnnotation:
         # Subsample to avoid extremely dense point clouds that produce tiny
         # initial gaussian scales (sub-pixel), which prevents any gradient
         # signal during training.
+        #TODO is this still necessary?
         max_seed_pts = 2000
         if points3D.shape[0] > max_seed_pts:
             indices = torch.randperm(points3D.shape[0])[:max_seed_pts]
