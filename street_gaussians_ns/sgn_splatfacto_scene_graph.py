@@ -128,14 +128,24 @@ class SplatfactoSceneGraphModel(SplatfactoModel):
         self.all_models = torch.nn.ModuleDict()
         self.config.background_model.use_sky_sphere = False
         self.config.background_model.sh_degree = self.config.sh_degree
+
+        # Load object annotations BEFORE background model so we can mask SfM points
+        self.object_annos: InterpolatedAnnotation = self.kwargs["metadata"].get("object_annos", InterpolatedAnnotation(anno_json_path=None))
+
+        # SfM masking: remove background seed points that fall inside dynamic
+        # object bounding boxes (paper Section 3.1 — "we ignore these parts by
+        # using the mask during feature extraction").
+        bg_kwargs = dict(self.kwargs)
+        if "seed_points" in bg_kwargs and bg_kwargs["seed_points"] is not None and len(self.object_annos.objects_meta):
+            bg_kwargs["seed_points"] = self._filter_seed_points(bg_kwargs["seed_points"])
+
         self.all_models["background"] = self.config.background_model.setup(
             scene_box=self.scene_box,
             num_train_data=self.num_train_data,
             model_idx_in_scene_graph=0,
-            **self.kwargs
+            **bg_kwargs
         )
 
-        self.object_annos: InterpolatedAnnotation = self.kwargs["metadata"].get("object_annos", InterpolatedAnnotation(anno_json_path=None))
         for idx, (obj_id, obj_meta) in enumerate(self.object_annos.objects_meta.items()):
             object_model_config = copy.deepcopy(self.config.object_model_template)
             object_model_config.use_sky_sphere = False
@@ -159,6 +169,28 @@ class SplatfactoSceneGraphModel(SplatfactoModel):
 
     def get_object_model_name(self, object_id):
         return f"object_{object_id}"
+
+    def _filter_seed_points(self, seed_points):
+        """Remove SfM points that fall inside any dynamic object bounding box.
+
+        Iterates over ALL annotation frames so that points on a moving object
+        are caught regardless of which frame the SfM triangulation used.
+        """
+        from nerfstudio.utils.rich_utils import CONSOLE
+        pts, rgb = seed_points
+        keep = torch.ones(pts.shape[0], dtype=torch.bool)
+        for _ts, boxes in self.object_annos.annos.items():
+            for box in boxes:
+                center = torch.tensor(box.center, dtype=pts.dtype, device=pts.device)
+                rot = torch.tensor(box.rot, dtype=pts.dtype, device=pts.device)   # (3,3) local→world
+                size = torch.tensor(box.size, dtype=pts.dtype, device=pts.device)  # already EXP_RATE-expanded & scaled
+                # Transform world→local: row-vector convention so pts @ rot == rot^T @ pts
+                pts_local = (pts - center) @ rot
+                inside = (pts_local.abs() < (size / 2)).all(dim=1)
+                keep &= ~inside
+        n_removed = int((~keep).sum().item())
+        CONSOLE.log(f"SfM masking: removed {n_removed}/{pts.shape[0]} background seed points inside dynamic-object bboxes")
+        return (pts[keep], rgb[keep])
 
     def build_frame_idx_map(self):
         frame_idx_map = {}
