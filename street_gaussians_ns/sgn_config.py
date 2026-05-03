@@ -46,7 +46,7 @@ street_gaussians_ns_method = MethodSpecification(
                 camera_optimizer=CameraOptimizerConfig(mode="off"),
                 bbox_optimizer=BBoxOptimizerConfig(mode="simple"),
                 use_sky_sphere=True,
-                sh_degree=3,
+                sh_degree=1,
                 background_model=SplatfactoModelConfig(
                     cull_alpha_thresh=0.02,
                     cull_scale_thresh=0.2,

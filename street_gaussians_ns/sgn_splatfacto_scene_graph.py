@@ -17,6 +17,52 @@ from nerfstudio.cameras.camera_utils import quaternion_from_matrix
 from nerfstudio.cameras.cameras import Cameras
 
 from street_gaussians_ns.sgn_splatfacto import SplatfactoModel, SplatfactoModelConfig, RGB2SH
+
+
+def project_bboxes_to_mask(annos: list, camera: Cameras, device) -> torch.Tensor:
+    """Project 3D bounding boxes to a 2D binary foreground mask.
+
+    Uses the camera intrinsics/extrinsics to project each box's 8 corners,
+    then fills the bounding-rectangle of the projected corners.
+    """
+    H, W = int(camera.height.item()), int(camera.width.item())
+    mask = torch.zeros(H, W, 1, device=device)
+    if not annos:
+        return mask
+
+    c2w = camera.camera_to_worlds[0]  # (3, 4)
+    R_c2w = c2w[:3, :3]
+    T_c2w = c2w[:3, 3]
+    # world-to-camera (OpenGL convention)
+    R_w2c = R_c2w.T
+    T_w2c = -R_w2c @ T_c2w
+    # Flip y,z to OpenCV convention (same flip as get_outputs)
+    R_edit = torch.diag(torch.tensor([1, -1, -1], device=device, dtype=R_w2c.dtype))
+    R_w2c_cv = R_edit @ R_w2c
+    T_w2c_cv = R_edit @ T_w2c
+
+    fx, fy = camera.fx.item(), camera.fy.item()
+    cx, cy = camera.cx.item(), camera.cy.item()
+
+    for box in annos:
+        corners = torch.tensor(box.verticles, device=device, dtype=R_w2c.dtype)  # (8,3)
+        # To camera (OpenCV)
+        cam_pts = (R_w2c_cv @ corners.T).T + T_w2c_cv  # (8,3)
+        z = cam_pts[:, 2]
+        valid = z > 0.01
+        if not valid.any():
+            continue
+        u = fx * cam_pts[valid, 0] / z[valid] + cx
+        v = fy * cam_pts[valid, 1] / z[valid] + cy
+        u_min = max(0, int(u.min().item()))
+        u_max = min(W - 1, int(u.max().item()))
+        v_min = max(0, int(v.min().item()))
+        v_max = min(H - 1, int(v.max().item()))
+        if u_min < u_max and v_min < v_max:
+            mask[v_min:v_max + 1, u_min:u_max + 1] = 1.0
+    return mask
+
+
 from street_gaussians_ns.data.utils.bbox_optimizers import BBoxOptimizerConfig, BBoxOptimizer
 from street_gaussians_ns.data.utils.dynamic_annotation import InterpolatedAnnotation, Box, parse_timestamp
 
@@ -42,8 +88,12 @@ class SplatfactoSceneGraphModelConfig(SplatfactoModelConfig):
     """Object model config"""
     bbox_optimizer: BBoxOptimizerConfig = field(default_factory=BBoxOptimizerConfig)
     """Bounding box optimizer config"""
-    object_acc_entropy_loss_mult: float = 0.001
-    """loss weight of object-background accumulation cross entropy loss"""
+    object_acc_entropy_loss_mult: float = 0.1
+    """loss weight of object-background accumulation cross entropy loss (paper: 0.1)"""
+    bg_suppress_loss_mult: float = 0.05
+    """loss weight penalising background accumulation inside projected foreground bounding boxes"""
+    decomp_loss_from_step: int = 500
+    """step from which decomposition losses (entropy + bg suppress) are active"""
     debug_pedestrian_color: bool = False
     """Phase 1 pedestrian extension: at eval time, force-paint pedestrian Gaussians
     in DEBUG_COLOR_BY_CLASS so they are visually unmistakable in renderings.
@@ -272,11 +322,12 @@ class SplatfactoSceneGraphModel(SplatfactoModel):
             submodel_features_dc = self.aggregate_submodel_var("features_dc", submodel_names)
         else:
             assert object_features_dc is not None, "object_features_dc should not be None when object_means is not None"
-            empty = torch.zeros(camera.height.item(), camera.width.item(), 1, device=self.device)
+            empty_1ch = torch.zeros(camera.height.item(), camera.width.item(), 1, device=self.device)
+            empty_3ch = torch.zeros(camera.height.item(), camera.width.item(), 3, device=self.device)
             if len(object_means) == 0:
                 if 'accumulation' in output_names and len(output_names)==1:
-                    return {'accumulation':empty}
-                return {'rgb': empty if sky_capture is None else sky_capture, 'depth': empty}
+                    return {'accumulation': empty_1ch}
+                return {'rgb': empty_3ch if sky_capture is None else sky_capture, 'depth': empty_1ch}
             submodel_means = torch.cat(object_means, dim=0)
             submodel_features_dc = torch.cat(object_features_dc, dim=0)
         submodel_opacities = self.aggregate_submodel_var("opacities", submodel_names)
@@ -393,11 +444,19 @@ class SplatfactoSceneGraphModel(SplatfactoModel):
         assert self.crop_box is None or self.training, "crop_box is not supported for scene graph model now"
         # forward like the original model
         out = super().get_outputs(camera)
-        # Only compute separate sub-model accumulations when needed (saves 2 extra rasterization passes)
-        if not self.training or (self.config.object_acc_entropy_loss_mult > 0. and self.step > self.config.background_model.stop_split_at):
+        # Compute separate sub-model accumulations for decomposition losses
+        need_decomp = (
+            not self.training
+            or (self.step >= self.config.decomp_loss_from_step
+                and (self.config.object_acc_entropy_loss_mult > 0. or self.config.bg_suppress_loss_mult > 0.))
+        )
+        if need_decomp:
             out['object_acc'] = (self.get_submodel_output(camera, [submodel_name for submodel_name in self.visible_model_names if submodel_name.startswith("object")],
                                                            object_means=object_means, object_features_dc=object_features_dc, output_names=['accumulation']))['accumulation']
             out['background_acc'] = (self.get_submodel_output(camera, ["background"], output_names=['accumulation']))['accumulation']
+        # Foreground mask from projected 3D bounding boxes (used by bg_suppress loss)
+        if self.training and self.config.bg_suppress_loss_mult > 0. and self.step >= self.config.decomp_loss_from_step:
+            out['fg_mask'] = project_bboxes_to_mask(annos_t if annos_t is not None else [], camera, self.device)
         if not self.training:
             with torch.no_grad():
                 background_output = self.get_submodel_output(camera, ["background"], sky_capture=out.get("sky", None), output_names=['rgb'])
@@ -417,10 +476,16 @@ class SplatfactoSceneGraphModel(SplatfactoModel):
         """
         losses = super().get_loss_dict(outputs, batch, metrics_dict)
 
-        if self.config.object_acc_entropy_loss_mult > 0. and self.step > self.config.background_model.stop_split_at and 'object_acc' in outputs:
+        if self.config.object_acc_entropy_loss_mult > 0. and self.step >= self.config.decomp_loss_from_step and 'object_acc' in outputs:
             object_acc = torch.clamp(outputs['object_acc'], min=1e-5, max=1-1e-5)
             losses['object_acc_entropy_loss'] = self.config.object_acc_entropy_loss_mult * \
             -(object_acc*torch.log(object_acc) + (1. - object_acc)*torch.log(1. - object_acc)).mean()
+
+        if self.config.bg_suppress_loss_mult > 0. and 'fg_mask' in outputs and 'background_acc' in outputs:
+            # Penalise the background model for rendering in foreground bbox regions
+            fg_mask = outputs['fg_mask']
+            bg_acc = outputs['background_acc']
+            losses['bg_suppress_loss'] = self.config.bg_suppress_loss_mult * (fg_mask * bg_acc).mean()
 
         return losses
 
