@@ -1135,13 +1135,13 @@ class SplatfactoModel(Model):
         if self.training and d > 1:
             newsize = (int(math.ceil(batch["image"].shape[0] / d)), int(math.ceil(batch["image"].shape[1] / d)))
             gt_img = TF.resize(batch["image"].permute(2, 0, 1), newsize, antialias=None).permute(1, 2, 0)
-            if "mask" in batch:
-                mask = TF.resize(
-                    batch["mask"].permute(2, 0, 1),
-                    newsize,
-                    antialias=None,
-                    interpolation=TF.InterpolationMode.NEAREST,
-                ).permute(1, 2, 0)
+            # if "mask" in batch:
+            #     mask = TF.resize(
+            #         batch["mask"].permute(2, 0, 1),
+            #         newsize,
+            #         antialias=None,
+            #         interpolation=TF.InterpolationMode.NEAREST,
+            #     ).permute(1, 2, 0)
             if "semantic" in batch:
                 gt_semantic = TF.resize(
                     batch["semantic"].permute(2, 0, 1),
@@ -1151,16 +1151,18 @@ class SplatfactoModel(Model):
                 ).permute(1, 2, 0)
         else:
             gt_img = batch["image"]
-            if "mask" in batch:
-                mask = batch["mask"]
+            # if "mask" in batch:
+            #     mask = batch["mask"]
             if "semantic" in batch:
                 gt_semantic = batch["semantic"]
 
         # RGB loss
         rgb = outputs["rgb"]
-        if mask is not None:
-            gt_img *= mask
-            rgb *= mask
+        #NOTE: do NOT mask gt_img and rgb. the photometric loss MUST still fire on the pixels that would get masked. Masking here would zero both branches and starve objects, leaving object_rgb empty
+        # if mask is not None:
+        #     mask = mask.to(rgb.device).float();
+        #     gt_img *= mask
+        #     rgb *= mask
         Ll1 = torch.abs(gt_img - rgb).mean()
         simloss = 1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...], rgb.permute(2, 0, 1)[None, ...])
         losses["Ll1"] = (1 - self.config.ssim_lambda) * Ll1

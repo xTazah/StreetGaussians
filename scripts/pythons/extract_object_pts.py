@@ -119,7 +119,7 @@ if __name__ == "__main__":
         if annotation_found_dict is not None:
             obbs = []
             for object in annotation_found_dict["objects"]:
-                if (object["is_moving"] or object["gid"] in moving_gids) and object["type"] == 'car':
+                if (object["is_moving"] or object["gid"] in moving_gids) and object["type"] in ('car','pedestrian'):
                     # if args.track_moving:
                     #     moving_gids.append(object["gid"])
                     if object["gid"] not in obj_pcd:

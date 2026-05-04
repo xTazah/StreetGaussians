@@ -35,6 +35,10 @@ from nerfstudio.scripts.render import BaseRender
 from street_gaussians_ns.data.sgn_datamanager import FullImageDatamanagerConfig
 from street_gaussians_ns.data.sgn_dataset import Dataset
 
+import os
+os.environ["MEDIAPY_FFMPEG_CODEC"] = "libx264"
+os.environ["MEDIAPY_FFMPEG_CRF"] = "23"
+
 
 @contextmanager
 def _disable_datamanager_setup(cls):

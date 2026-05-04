@@ -434,6 +434,7 @@ class SplatfactoSceneGraphModel(SplatfactoModel):
         need_decomp = (
             not self.training
             or (self.step >= self.config.decomp_loss_from_step
+                and self.step % 3 == 0
                 and (self.config.object_acc_entropy_loss_mult > 0. or self.config.bg_suppress_loss_mult > 0.))
         )
         if need_decomp:
