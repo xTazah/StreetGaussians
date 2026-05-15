@@ -330,7 +330,15 @@ class InterpolatedAnnotation:
             if self.self_car_label is not None:
                 if obj['gid'] == self.self_car_label:
                     continue
-            center = obj['translation']
+            # Apply the same world-frame axis permutation that extract_waymo.py
+            # applies to camera poses. Camera transforms get rows [1,0,2,3]
+            # swapped and row 2 negated; bbox translations don't, leaving them
+            # in raw Waymo world while cameras live in nerfstudio convention.
+            # P_world = [[0,1,0],[1,0,0],[0,0,-1]]  (new x = old y, new y = old x, new z = -old z)
+            _t_raw = obj['translation']
+            center = [_t_raw[1], _t_raw[0], -_t_raw[2]]
+            # Same permutation applied to the rotation: R_new = P @ R_old.
+            # Equivalent in quaternion form is computed below from the rotated rot matrix.
             quat = obj['rotation']
             trackId = obj['gid']
             ply_path = self.lidar_path / f"{trackId}.ply"
@@ -340,22 +348,42 @@ class InterpolatedAnnotation:
                 # (typically because MIN_POINTS_PER_CLASS in generate_annotations.py
                 # filtered it out). Without this warning the parser would just skip
                 # in silence and the user has no idea why a pedestrian is missing.
-                CONSOLE.log(
-                    f"[yellow]Phase 1 pedestrian extension: {obj['type']} object "
-                    f"{trackId} has no PLY at {ply_path.name}, skipping.[/yellow]"
-                )
+                # CONSOLE.log(
+                #     f"[yellow]Phase 1 pedestrian extension: {obj['type']} object "
+                #     f"{trackId} has no PLY at {ply_path.name}, skipping.[/yellow]"
+                # )
                 continue
             # Phase 1 pedestrian extension: pass obj_type for class-aware threshold.
             pts = self.load_object_3D_points(trackId, obj_type=obj['type'])
             if pts is None:
                 continue
             rot = quaternion_matrix(quat)[:3, :3]
+            # Apply world-frame axis permutation to the rotation matrix so the
+            # object→world rotation matches the camera-side world frame.
+            _P_world = np.array([[0, 1, 0], [1, 0, 0], [0, 0, -1]], dtype=rot.dtype)
+            rot = _P_world @ rot
+            # Keep quat consistent with the rotated rot matrix (else downstream
+            # code that reads box.quat would have stale pre-swap orientation).
+            _rot_4 = np.eye(4)
+            _rot_4[:3, :3] = rot
+            quat = quaternion_from_matrix(_rot_4)
             size = EXP_RATE*np.array(obj['size'])
+            _center_raw = np.array(center).copy()
             box = Box(center, trackId=trackId, size=size,
                       label=obj['type'], frame_id=timestamp, frame=frame, rot=rot, quat=quat)
             box.transform(
                 self.transform_matrix[:3, 3], self.transform_matrix[:3, :3])
+            _center_post_tf = box.center.copy()
             box.scale(self.scale_factor)
+            if not hasattr(self, '_scale_debug_printed'):
+                self._scale_debug_printed = True
+                print(
+                    f"[scale-debug] scale_factor={self.scale_factor}\n"
+                    f"[scale-debug] transform_matrix=\n{self.transform_matrix}\n"
+                    f"[scale-debug] first_box: raw_center={_center_raw} "
+                    f"post_transform={_center_post_tf} post_scale={box.center} "
+                    f"raw_size={size} post_scale_size={box.size}"
+                )
             boxes.append(box)
             # use first box as meta
             if trackId not in self.objects_meta:

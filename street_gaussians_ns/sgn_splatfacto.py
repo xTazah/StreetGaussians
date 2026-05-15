@@ -547,7 +547,19 @@ class SplatfactoModel(Model):
                 return
             grads = self.xys.grad.detach().norm(dim=-1)  # type: ignore
             # print(f"grad norm min {grads.min().item()} max {grads.max().item()} mean {grads.mean().item()} size {grads.shape}")
-            if self.xys_grad_norm is None:
+            # Re-init buffers when the per-Gaussian count has changed since the
+            # buffers were last sized. This happens for object sub-models in the
+            # scene-graph: after a refinement, num_points changes; if the object
+            # is invisible for a few iters the reset path doesn't necessarily
+            # fire, and on next visibility visible_mask has the NEW size while
+            # vis_counts has the OLD size — boolean-mask assignment past the
+            # buffer end is the "illegal memory access" CUDA error.
+            n_now = visible_mask.shape[0]
+            need_reinit = (
+                self.xys_grad_norm is None
+                or self.xys_grad_norm.shape[0] != n_now
+            )
+            if need_reinit:
                 self.xys_grad_norm = grads
                 self.vis_counts = torch.ones_like(self.xys_grad_norm)
             else:
@@ -556,7 +568,7 @@ class SplatfactoModel(Model):
                 self.xys_grad_norm[visible_mask] = grads[visible_mask] + self.xys_grad_norm[visible_mask]
 
             # update the max screen size, as a ratio of number of pixels
-            if self.max_2Dsize is None:
+            if self.max_2Dsize is None or self.max_2Dsize.shape[0] != n_now:
                 self.max_2Dsize = torch.zeros_like(self.radii, dtype=torch.float32)
             newradii = self.radii.detach()[visible_mask]
             self.max_2Dsize[visible_mask] = torch.maximum(
@@ -892,7 +904,7 @@ class SplatfactoModel(Model):
             features_rest_crop = self.features_rest
             scales_crop = self.scales
             quats_crop = self.quats
-        scales_crop = torch.exp(scales_crop)
+        scales_crop = torch.exp(torch.clamp(scales_crop, min=-15.0, max=5.0))
         colors_crop = torch.cat((features_dc_crop, features_rest_crop), dim=1)
 
         self.xys, self.depths, self.radii, self.conics, self.num_tiles_hit, cov3d = project_gaussians(  # type: ignore
@@ -993,7 +1005,56 @@ class SplatfactoModel(Model):
                 )
                 for name in output_names
             }
-        
+
+        # Filter out invisible gaussians (radii==0 or NaN/Inf projections) to
+        # prevent the rasterize CUDA kernel from accessing invalid memory.
+        # Cap extreme num_tiles_hit values that can cause integer overflow
+        # in cumsum or out-of-bounds access in the rasterize kernel.
+        max_tiles = int(H // 16 + 1) * int(W // 16 + 1)  # total tiles in image
+        visible_mask = (
+            (radii > 0)
+            & (num_tiles_hit > 0)
+            & (num_tiles_hit <= max_tiles)
+            & (depths > 0)
+            & (~torch.isnan(xys).any(dim=-1))
+            & (~torch.isinf(xys).any(dim=-1))
+            & (~torch.isnan(conics).any(dim=-1))
+            & (~torch.isinf(conics).any(dim=-1))
+        )
+        n_filtered = int(xys.shape[0] - visible_mask.sum().item())
+        if n_filtered > 0:
+            if not self.training:
+                print(
+                    f"[render-debug] visibility filter: kept {visible_mask.sum().item()}/{xys.shape[0]} "
+                    f"gaussians (filtered {n_filtered}: "
+                    f"radii0={(radii <= 0).sum().item()}, "
+                    f"tiles0={(num_tiles_hit <= 0).sum().item()}, "
+                    f"neg_depth={(depths <= 0).sum().item()}, "
+                    f"nan_xys={torch.isnan(xys).any(dim=-1).sum().item()}, "
+                    f"inf_xys={torch.isinf(xys).any(dim=-1).sum().item()}, "
+                    f"nan_conics={torch.isnan(conics).any(dim=-1).sum().item()}, "
+                    f"inf_conics={torch.isinf(conics).any(dim=-1).sum().item()}, "
+                    f"tiles_over_max={(num_tiles_hit > max_tiles).sum().item()})"
+                )
+            xys = xys[visible_mask]
+            depths = depths[visible_mask]
+            radii = radii[visible_mask]
+            conics = conics[visible_mask]
+            num_tiles_hit = num_tiles_hit[visible_mask]
+            rgbs = rgbs[visible_mask]
+            opacities = opacities[visible_mask]
+
+        if xys.shape[0] == 0:
+            dummy_grad = self.means.sum() * 0.0 + self.scales.sum() * 0.0 + self.quats.sum() * 0.0
+            return {
+                name: (
+                    background.repeat(H, W, 1) + dummy_grad
+                    if name == "rgb" or name == "sky"
+                    else torch.zeros(H, W, 1, device=self.device) + dummy_grad
+                )
+                for name in output_names
+            }
+
         # apply the compensation of screen space blurring to gaussians
         if self.config.rasterize_mode == "antialiased":
             opacities = torch.sigmoid(opacities) #* comp[:, None]
@@ -1021,7 +1082,13 @@ class SplatfactoModel(Model):
             # Ensure alpha is 1-channel if gsplat returns multi-channel
             if alpha.shape[-1] > 1:
                 alpha = alpha[..., :1]
-            
+
+            # Sync CUDA after alpha rasterize to catch async errors before
+            # the RGB rasterize — otherwise the error surfaces in the wrong
+            # place and the traceback is misleading.
+            if not self.training:
+                torch.cuda.synchronize()
+
             # Generate RGB
             rgb = rasterize_gaussians(
                 xys,

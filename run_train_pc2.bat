@@ -6,8 +6,10 @@ set "LIB=%LIB%;c:\Users\koehl\anaconda3\libs"
 ::"D:\Git\StreetGaussians\.venv\Scripts\sgn-train.exe" street-gaussians-ns --data .\waymo-dataset\sgn-data\031 --experiment-name out031_v1
 ::"D:\Git\StreetGaussians\.venv\Scripts\sgn-train.exe" street-gaussians-ns --data .\waymo-dataset\sgn-data\002 --experiment-name output_002_v8 --load-checkpoint outputs/output_002_v8/street-gaussians-ns/2026-04-25_211911/nerfstudio_models/step-000009000.ckpt
 
-set CLIP_DIR=.\waymo-dataset\sgn-data\validation\1024360143612057520_3580_000_3600_000
-set EXP_NAME=output_pedestrians
+set CLIP_DIR=.\waymo-dataset\sgn-data\validation\10203656353524179475_7625_000_7645_000
+set EXP_NAME=output_desert
+
+set CUDA_LAUNCH_BLOCKING=1
 
 "D:\Git\StreetGaussians\.venv\Scripts\sgn-train.exe" street-gaussians-ns ^
     --experiment-name %EXP_NAME% ^

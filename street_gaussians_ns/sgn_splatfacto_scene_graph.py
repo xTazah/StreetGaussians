@@ -300,29 +300,119 @@ class SplatfactoSceneGraphModel(SplatfactoModel):
             assert isinstance(a, torch.Tensor)
         return torch.cat(vars, dim=0)
 
-    def get_submodel_output(self, camera: Cameras,  submodel_names: List[str], sky_capture=None, object_means=None, object_features_dc=None, output_names=[]) -> torch.Tensor:
+    def get_submodel_output(self, camera: Cameras,  submodel_names: List[str], sky_capture=None, object_means=None, object_quats=None, object_features_dc=None, output_names=[]) -> torch.Tensor:
+        from gsplat.project_gaussians import project_gaussians
+        from street_gaussians_ns.sgn_splatfacto import get_projection_matrix
         camera_downscale = self._get_downscale_factor()
         camera.rescale_output_resolution(1 / camera_downscale)
         if object_means is None:
             submodel_means = self.aggregate_submodel_var("means", submodel_names)
             submodel_features_dc = self.aggregate_submodel_var("features_dc", submodel_names)
+            submodel_quats = self.aggregate_submodel_var("quats", submodel_names)
         else:
             assert object_features_dc is not None, "object_features_dc should not be None when object_means is not None"
+            assert object_quats is not None, "object_quats should not be None when object_means is not None"
             empty_1ch = torch.zeros(camera.height.item(), camera.width.item(), 1, device=self.device)
             empty_3ch = torch.zeros(camera.height.item(), camera.width.item(), 3, device=self.device)
             if len(object_means) == 0:
+                camera.rescale_output_resolution(camera_downscale)
                 if 'accumulation' in output_names and len(output_names)==1:
                     return {'accumulation': empty_1ch}
                 return {'rgb': empty_3ch if sky_capture is None else sky_capture, 'depth': empty_1ch}
             submodel_means = torch.cat(object_means, dim=0)
             submodel_features_dc = torch.cat(object_features_dc, dim=0)
+            submodel_quats = torch.cat(object_quats, dim=0)
         submodel_opacities = self.aggregate_submodel_var("opacities", submodel_names)
         submodel_features_rest = self.aggregate_submodel_var("features_rest", submodel_names)
-        submodel_xys = self.aggregate_submodel_var("xys", submodel_names)
-        submodel_depths = self.aggregate_submodel_var("depths", submodel_names)
-        submodel_radii = self.aggregate_submodel_var("radii", submodel_names)
-        submodel_conics = self.aggregate_submodel_var("conics", submodel_names)
-        submodel_num_tiles_hit = self.aggregate_submodel_var("num_tiles_hit", submodel_names)
+        submodel_scales = self.aggregate_submodel_var("scales", submodel_names)
+
+        # --- Pre-projection input validation ---
+        # Filter gaussians with NaN/Inf in means, scales, or quats BEFORE
+        # they reach the project_gaussians CUDA kernel.  The kernel can
+        # trigger an async illegal-memory-access for degenerate inputs that
+        # only surfaces later in rasterize_gaussians.
+        valid_input = (
+            (~torch.isnan(submodel_means).any(dim=-1))
+            & (~torch.isinf(submodel_means).any(dim=-1))
+            & (~torch.isnan(submodel_scales).any(dim=-1))
+            & (~torch.isinf(submodel_scales).any(dim=-1))
+            & (~torch.isnan(submodel_quats).any(dim=-1))
+            & (~torch.isinf(submodel_quats).any(dim=-1))
+        )
+        n_invalid = int(submodel_means.shape[0] - valid_input.sum().item())
+        if n_invalid > 0:
+            if not self.training:
+                print(
+                    f"[render-debug] pre-projection filter: removed {n_invalid}/{submodel_means.shape[0]} "
+                    f"gaussians with NaN/Inf inputs"
+                )
+            submodel_means = submodel_means[valid_input]
+            submodel_scales = submodel_scales[valid_input]
+            submodel_quats = submodel_quats[valid_input]
+            submodel_opacities = submodel_opacities[valid_input]
+            submodel_features_dc = submodel_features_dc[valid_input]
+            submodel_features_rest = submodel_features_rest[valid_input]
+
+        # Clamp log-scales to prevent extreme covariance values that can
+        # crash the projection CUDA kernel.
+        # exp(-15) ≈ 3e-7 (tiny, invisible), exp(5) ≈ 148 (large but safe)
+        submodel_scales = torch.clamp(submodel_scales, min=-15.0, max=5.0)
+
+        H, W = int(camera.height.item()), int(camera.width.item())
+        empty_1ch = torch.zeros(H, W, 1, device=self.device)
+        empty_3ch = torch.zeros(H, W, 3, device=self.device)
+        if submodel_means.shape[0] == 0:
+            camera.rescale_output_resolution(camera_downscale)
+            if 'accumulation' in output_names and len(output_names) == 1:
+                return {'accumulation': empty_1ch}
+            return {'rgb': empty_3ch if sky_capture is None else sky_capture, 'depth': empty_1ch}
+
+        # Re-project from scratch for this sub-model render. Reusing the
+        # projection state (xys/conics/num_tiles_hit/...) from the prior
+        # aggregated render is invalid: gsplat's tile-bin allocation is
+        # specific to the rasterize call that produced it, and feeding stale
+        # bin metadata into a new rasterize call causes out-of-bounds writes
+        # inside the CUDA kernel ("illegal memory access" at the next sync).
+        c2w = camera.camera_to_worlds.squeeze()
+        R_cam = c2w[:3, :3]
+        T_cam = c2w[:3, 3:4]
+        # gsplat convention: flip y, z of camera basis to match its expected frame
+        R_edit = torch.diag(torch.tensor([1, -1, -1], device=self.device, dtype=R_cam.dtype))
+        R_cam = R_cam @ R_edit
+        R_inv = R_cam.T
+        T_inv = -R_inv @ T_cam
+        viewmat = torch.eye(4, device=R_cam.device, dtype=R_cam.dtype)
+        viewmat[:3, :3] = R_inv
+        viewmat[:3, 3:4] = T_inv
+        viewmat = viewmat.float()
+        fovx = 2 * math.atan(W / (2 * camera.fx.item()))
+        fovy = 2 * math.atan(H / (2 * camera.fy.item()))
+        projmat = get_projection_matrix(0.01, 100.0, fovx, fovy, device=self.device)
+        block_width = self.config.block_width
+        tile_bounds = (
+            int((W + block_width - 1) // block_width),
+            int((H + block_width - 1) // block_width),
+            1,
+        )
+        submodel_xys, submodel_depths, submodel_radii, submodel_conics, submodel_num_tiles_hit, _ = project_gaussians(
+            submodel_means,
+            torch.exp(submodel_scales),
+            1,
+            submodel_quats / submodel_quats.norm(dim=-1, keepdim=True),
+            viewmat.squeeze()[:3, :],
+            projmat @ viewmat,
+            camera.fx.item(),
+            camera.fy.item(),
+            camera.cx.item(),
+            camera.cy.item(),
+            H,
+            W,
+            tile_bounds,
+        )
+        # Synchronize CUDA to surface any async errors from project_gaussians
+        # at this point rather than letting them propagate to rasterize.
+        if not self.training:
+            torch.cuda.synchronize()
         # render submodel
         colors = torch.cat((submodel_features_dc, submodel_features_rest), dim=1)
         if self.config.sh_degree > 0:
@@ -377,6 +467,31 @@ class SplatfactoSceneGraphModel(SplatfactoModel):
         exist_frame = False
         if timestamp in self.object_annos.all_names:
             exist_frame = True
+        if not self.training:
+            anno_range = (
+                f"[{self.object_annos.all_names[0]} .. {self.object_annos.all_names[-1]}]"
+                if len(self.object_annos.all_names) else "<empty>"
+            )
+            print(
+                f"[render-debug] camera.time={camera.times.item()} "
+                f"parsed_ts={timestamp} exist_frame={exist_frame} "
+                f"annos_t_len={0 if annos_t is None else len(annos_t)} "
+                f"anno_keys_range={anno_range} "
+                f"all_models_count={len(self.all_models)}"
+            )
+            if annos_t:
+                _per_anno = []
+                for _a in annos_t:
+                    _mn = self.get_object_model_name(_a.trackId)
+                    _m = self.all_models.get(_mn) if hasattr(self.all_models, "get") else (self.all_models[_mn] if _mn in self.all_models else None)
+                    if _m is not None:
+                        _op = torch.sigmoid(_m.opacities).detach()
+                        _op_str = f"opac[min={_op.min().item():.4f},mean={_op.mean().item():.4f},max={_op.max().item():.4f}]"
+                    else:
+                        _op_str = "MISSING"
+                    _np = (_m.num_points if _m is not None else "MISSING")
+                    _per_anno.append(f"{_a.trackId[:8]}:np={_np}:{_op_str}")
+                print(f"[render-debug]   per-anno: {' | '.join(_per_anno)}")
         if annos_t is not None and len(annos_t):
             for anno in annos_t:
                 trackId = anno.trackId
@@ -430,23 +545,53 @@ class SplatfactoSceneGraphModel(SplatfactoModel):
         assert self.crop_box is None or self.training, "crop_box is not supported for scene graph model now"
         # forward like the original model
         out = super().get_outputs(camera)
-        # Compute separate sub-model accumulations for decomposition losses
+        # Sync CUDA to catch any async errors from the main render's
+        # project_gaussians / rasterize_gaussians before they propagate
+        # to submodel renders and produce misleading tracebacks.
+        if not self.training:
+            torch.cuda.synchronize()
+        # Only run the extra rasterize passes for decomp losses during training
+        # after densification ends. Running them during eval or during active
+        # densification causes gsplat illegal-memory-access in
+        # compute_cumulative_intersects. object_acc/background_acc are only
+        # needed for training losses anyway.
         need_decomp = (
-            not self.training
-            or (self.step >= self.config.decomp_loss_from_step
-                and self.step % 3 == 0
-                and (self.config.object_acc_entropy_loss_mult > 0. or self.config.bg_suppress_loss_mult > 0.))
+            self.training
+            and self.step > self.config.background_model.stop_split_at
+            and (self.config.object_acc_entropy_loss_mult > 0. or self.config.bg_suppress_loss_mult > 0.)
         )
         if need_decomp:
             out['object_acc'] = (self.get_submodel_output(camera, [submodel_name for submodel_name in self.visible_model_names if submodel_name.startswith("object")],
-                                                           object_means=object_means, object_features_dc=object_features_dc, output_names=['accumulation']))['accumulation']
+                                                           object_means=object_means, object_quats=object_quats, object_features_dc=object_features_dc, output_names=['accumulation']))['accumulation']
             out['background_acc'] = (self.get_submodel_output(camera, ["background"], output_names=['accumulation']))['accumulation']
         if not self.training:
             with torch.no_grad():
                 background_output = self.get_submodel_output(camera, ["background"], sky_capture=out.get("sky", None), output_names=['rgb'])
                 out.update({f"background_{k}":v for k, v in background_output.items()})
-                object_output = self.get_submodel_output(camera, [submodel_name for submodel_name in self.visible_model_names if submodel_name.startswith("object")], object_means=object_means, object_features_dc=object_features_dc, output_names=['rgb'])
+                object_output = self.get_submodel_output(camera, [submodel_name for submodel_name in self.visible_model_names if submodel_name.startswith("object")], object_means=object_means, object_quats=object_quats, object_features_dc=object_features_dc, output_names=['rgb'])
                 out.update({f"object_{k}":v for k, v in object_output.items()})
+                _orgb = object_output.get('rgb')
+                if _orgb is not None:
+                    print(
+                        f"[render-debug]   object_rgb stats: "
+                        f"min={_orgb.min().item():.4f} max={_orgb.max().item():.4f} "
+                        f"mean={_orgb.mean().item():.4f} nonzero_frac={(_orgb>0.001).float().mean().item():.4f}"
+                    )
+                _obj_names = [n for n in self.visible_model_names if n.startswith("object")]
+                if _obj_names and len(object_means) > 0:
+                    cam_pos = camera.camera_to_worlds[0,:3,3].tolist() if camera.camera_to_worlds.dim()==3 else camera.camera_to_worlds[:3,3].tolist()
+                    print(f"[render-debug]   camera_pos={cam_pos}")
+                    for _i, (_om, _name) in enumerate(zip(object_means, _obj_names)):
+                        _ann = next((_a for _a in annos_t if self.get_object_model_name(_a.trackId) == _name), None)
+                        _local = self.all_models[_name].means.detach()
+                        _ctr = _ann.center if _ann is not None else None
+                        print(
+                            f"[render-debug]     car{_i} {_name[-12:]}: "
+                            f"world_mean=({_om[:,0].mean().item():.2f},{_om[:,1].mean().item():.2f},{_om[:,2].mean().item():.2f}) "
+                            f"world_span=({(_om[:,0].max()-_om[:,0].min()).item():.2f},{(_om[:,1].max()-_om[:,1].min()).item():.2f},{(_om[:,2].max()-_om[:,2].min()).item():.2f}) "
+                            f"local_span=({(_local[:,0].max()-_local[:,0].min()).item():.2f},{(_local[:,1].max()-_local[:,1].min()).item():.2f},{(_local[:,2].max()-_local[:,2].min()).item():.2f}) "
+                            f"anno_center={_ctr}"
+                        )
 
         return out
 

@@ -54,7 +54,7 @@ street_gaussians_ns_method = MethodSpecification(
                     warmup_length=500,
                     refine_every=100,
                     reset_alpha_every=3000,
-                    stop_split_at=15000,
+                    stop_split_at=20000,
                     fourier_features_dim=1,
                 ),
                 object_model_template=SplatfactoModelConfig(
@@ -64,7 +64,7 @@ street_gaussians_ns_method = MethodSpecification(
                     warmup_length=500,
                     refine_every=100,
                     reset_alpha_every=3000,
-                    stop_split_at=15000,
+                    stop_split_at=20000,
                     fourier_features_dim=5,
                     num_random=10000,
                 )

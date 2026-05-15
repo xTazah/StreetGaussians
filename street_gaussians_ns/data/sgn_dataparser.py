@@ -102,8 +102,18 @@ class ColmapDataParserConfig(DataParserConfig):
     """The specified data will be forcely saved or updated after undistorting."""
     load_dynamic_annotations: bool = False
     """Whether to load dynamic annotations."""
-    frame_select=[100,190]
-    """Frame selection for dynamic annotations."""
+    frame_select: Optional[List[int]] = None
+    """Frame selection [start, end) per camera. None = use all frames.
+    Was hardcoded to [100, 190] which silently dropped the first 100 frames
+    and everything after frame 189 from BOTH train AND render — that's why
+    rendered gt_rgb appeared to "start 4 seconds in" and pedestrians visible
+    in the early frames of the source clip never showed up at all."""
+
+
+_DATAPARSER_OUTPUT_CACHE: Dict[str, "DataparserOutputs"] = {}
+"""Process-global cache so a second ColmapDataParser instance (e.g. the one
+the render script builds in addition to the one inside eval_setup's pipeline)
+doesn't redo all the work."""
 
 
 class ColmapDataParser(DataParser):
@@ -293,6 +303,13 @@ class ColmapDataParser(DataParser):
         return indices
 
     def _generate_dataparser_outputs(self, split: str = "train", **kwargs):
+        cache_key = (
+            f"{self.config.data.absolute()}|{split}"
+            + (f"|{sorted(kwargs.items())}" if kwargs else "")
+        )
+        if cache_key in _DATAPARSER_OUTPUT_CACHE:
+            CONSOLE.log(f"[dim]Reusing cached dataparser outputs for split '{split}'[/dim]")
+            return _DATAPARSER_OUTPUT_CACHE[cache_key]
         assert self.config.data.exists(), f"Data directory {self.config.data} does not exist."
         colmap_path = self.config.data / self.config.colmap_path
         assert colmap_path.exists(), f"Colmap path {colmap_path} does not exist."
@@ -444,10 +461,23 @@ class ColmapDataParser(DataParser):
             # Load 3D points
             metadata.update(self._load_3D_points(colmap_path, transform_matrix, scale_factor))
         if self.config.load_dynamic_annotations:
-            # Use the same transform as background points (no extra colmap
-            # translation — our data wasn't produced by real COLMAP).
+            # Cameras went through TWO transforms before the dataparser sees
+            # them: (1) transform2colmap.py subtracted -first_frame_pose*0.98
+            # from every camera so COLMAP got near-origin coords, then (2)
+            # auto_orient_and_center_poses added the small `transform_matrix`
+            # adjustment. Bboxes load straight from annotation.json (post our
+            # axis-swap fix in dynamic_annotation.py) and therefore need BOTH
+            # transforms applied. Compose them: T_anno = transform_matrix @
+            # T_colmap_shift, so applying T_anno @ p first does the colmap
+            # shift then the auto_orient (matching what cameras went through).
             transform_matrix_anno = np.eye(4)
             transform_matrix_anno[:3, :] = transform_matrix.numpy()
+            if "applied_translation_in_colmap" in meta:
+                T_colmap_shift = np.eye(4)
+                T_colmap_shift[:3, 3] = np.asarray(
+                    meta["applied_translation_in_colmap"], dtype=np.float64
+                )
+                transform_matrix_anno = transform_matrix_anno @ T_colmap_shift
             metadata.update({"object_annos":InterpolatedAnnotation(
                 anno_json_path=self.config.data / 'annotation.json',
                 lidar_path=self.config.data / 'aggregate_lidar' / 'dynamic_objects',
@@ -469,6 +499,7 @@ class ColmapDataParser(DataParser):
                 **metadata,
             },
         )
+        _DATAPARSER_OUTPUT_CACHE[cache_key] = dataparser_outputs
         return dataparser_outputs
 
     def _load_3D_points(self, colmap_path: Path, transform_matrix: torch.Tensor, scale_factor: float):
