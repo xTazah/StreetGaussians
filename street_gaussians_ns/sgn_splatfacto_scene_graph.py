@@ -5,7 +5,6 @@ from typing import Dict, List, Type, Union
 import copy
 import math
 
-from gsplat.sh import spherical_harmonics
 from pytorch3d.transforms import quaternion_multiply
 from torch.nn import Parameter
 import mediapy as media
@@ -301,8 +300,6 @@ class SplatfactoSceneGraphModel(SplatfactoModel):
         return torch.cat(vars, dim=0)
 
     def get_submodel_output(self, camera: Cameras,  submodel_names: List[str], sky_capture=None, object_means=None, object_quats=None, object_features_dc=None, output_names=[]) -> torch.Tensor:
-        from gsplat.project_gaussians import project_gaussians
-        from street_gaussians_ns.sgn_splatfacto import get_projection_matrix
         camera_downscale = self._get_downscale_factor()
         camera.rescale_output_resolution(1 / camera_downscale)
         if object_means is None:
@@ -326,36 +323,7 @@ class SplatfactoSceneGraphModel(SplatfactoModel):
         submodel_features_rest = self.aggregate_submodel_var("features_rest", submodel_names)
         submodel_scales = self.aggregate_submodel_var("scales", submodel_names)
 
-        # --- Pre-projection input validation ---
-        # Filter gaussians with NaN/Inf in means, scales, or quats BEFORE
-        # they reach the project_gaussians CUDA kernel.  The kernel can
-        # trigger an async illegal-memory-access for degenerate inputs that
-        # only surfaces later in rasterize_gaussians.
-        valid_input = (
-            (~torch.isnan(submodel_means).any(dim=-1))
-            & (~torch.isinf(submodel_means).any(dim=-1))
-            & (~torch.isnan(submodel_scales).any(dim=-1))
-            & (~torch.isinf(submodel_scales).any(dim=-1))
-            & (~torch.isnan(submodel_quats).any(dim=-1))
-            & (~torch.isinf(submodel_quats).any(dim=-1))
-        )
-        n_invalid = int(submodel_means.shape[0] - valid_input.sum().item())
-        if n_invalid > 0:
-            if not self.training:
-                print(
-                    f"[render-debug] pre-projection filter: removed {n_invalid}/{submodel_means.shape[0]} "
-                    f"gaussians with NaN/Inf inputs"
-                )
-            submodel_means = submodel_means[valid_input]
-            submodel_scales = submodel_scales[valid_input]
-            submodel_quats = submodel_quats[valid_input]
-            submodel_opacities = submodel_opacities[valid_input]
-            submodel_features_dc = submodel_features_dc[valid_input]
-            submodel_features_rest = submodel_features_rest[valid_input]
-
-        # Clamp log-scales to prevent extreme covariance values that can
-        # crash the projection CUDA kernel.
-        # exp(-15) ≈ 3e-7 (tiny, invisible), exp(5) ≈ 148 (large but safe)
+        # Clamp log-scales for numerical safety (same window the parent uses).
         submodel_scales = torch.clamp(submodel_scales, min=-15.0, max=5.0)
 
         H, W = int(camera.height.item()), int(camera.width.item())
@@ -367,16 +335,11 @@ class SplatfactoSceneGraphModel(SplatfactoModel):
                 return {'accumulation': empty_1ch}
             return {'rgb': empty_3ch if sky_capture is None else sky_capture, 'depth': empty_1ch}
 
-        # Re-project from scratch for this sub-model render. Reusing the
-        # projection state (xys/conics/num_tiles_hit/...) from the prior
-        # aggregated render is invalid: gsplat's tile-bin allocation is
-        # specific to the rasterize call that produced it, and feeding stale
-        # bin metadata into a new rasterize call causes out-of-bounds writes
-        # inside the CUDA kernel ("illegal memory access" at the next sync).
+        # Build the gsplat 1.x viewmat/intrinsics. Same y/z axis flip the
+        # parent get_outputs path uses (nerfstudio OpenGL -> gsplat OpenCV).
         c2w = camera.camera_to_worlds.squeeze()
         R_cam = c2w[:3, :3]
         T_cam = c2w[:3, 3:4]
-        # gsplat convention: flip y, z of camera basis to match its expected frame
         R_edit = torch.diag(torch.tensor([1, -1, -1], device=self.device, dtype=R_cam.dtype))
         R_cam = R_cam @ R_edit
         R_inv = R_cam.T
@@ -385,59 +348,31 @@ class SplatfactoSceneGraphModel(SplatfactoModel):
         viewmat[:3, :3] = R_inv
         viewmat[:3, 3:4] = T_inv
         viewmat = viewmat.float()
-        fovx = 2 * math.atan(W / (2 * camera.fx.item()))
-        fovy = 2 * math.atan(H / (2 * camera.fy.item()))
-        projmat = get_projection_matrix(0.01, 100.0, fovx, fovy, device=self.device)
-        block_width = self.config.block_width
-        tile_bounds = (
-            int((W + block_width - 1) // block_width),
-            int((H + block_width - 1) // block_width),
-            1,
+        K = torch.tensor(
+            [
+                [camera.fx.item(), 0.0, camera.cx.item()],
+                [0.0, camera.fy.item(), camera.cy.item()],
+                [0.0, 0.0, 1.0],
+            ],
+            device=self.device,
+            dtype=torch.float32,
         )
-        submodel_xys, submodel_depths, submodel_radii, submodel_conics, submodel_num_tiles_hit, _ = project_gaussians(
-            submodel_means,
-            torch.exp(submodel_scales),
-            1,
-            submodel_quats / submodel_quats.norm(dim=-1, keepdim=True),
-            viewmat.squeeze()[:3, :],
-            projmat @ viewmat,
-            camera.fx.item(),
-            camera.fy.item(),
-            camera.cx.item(),
-            camera.cy.item(),
-            H,
-            W,
-            tile_bounds,
-        )
-        # Synchronize CUDA to surface any async errors from project_gaussians
-        # at this point rather than letting them propagate to rasterize.
-        if not self.training:
-            torch.cuda.synchronize()
-        # render submodel
+
         colors = torch.cat((submodel_features_dc, submodel_features_rest), dim=1)
-        if self.config.sh_degree > 0:
-            viewdirs = submodel_means.detach() - camera.camera_to_worlds.detach()[..., :3, 3]  # (N, 3)
-            viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True)
-            n = min(self.step // self.config.sh_degree_interval, self.config.sh_degree)
-            if not self.training:
-                n = self.config.sh_degree
-            rgbs = spherical_harmonics(n, viewdirs, colors)
-            rgbs = torch.clamp(rgbs + 0.5, min=0.0)  # type: ignore
-        else:
-            rgbs = torch.sigmoid(colors[:, 0, :])
         gaussian_attrs = {
             "means": submodel_means,
-            "colors": colors,
+            "quats": submodel_quats,
+            "scales": torch.exp(submodel_scales),
             "opacities": submodel_opacities,
-            "xys": submodel_xys,
-            "depths": submodel_depths,
-            "radii": submodel_radii,
-            "conics": submodel_conics,
-            "num_tiles_hit": submodel_num_tiles_hit,
+            "colors": colors,
+            "viewmat": viewmat,
+            "K": K,
+            "H": H,
+            "W": W,
         }
         if sky_capture is not None:
             gaussian_attrs["sky_capture"] = sky_capture
-        outputs = self.render_gaussian_attrs(camera, gaussian_attrs, output_names)
+        outputs = self.render_gaussian_attrs(camera, gaussian_attrs, output_names, update_state=False)
         camera.rescale_output_resolution(camera_downscale)
         return outputs
 
@@ -545,11 +480,6 @@ class SplatfactoSceneGraphModel(SplatfactoModel):
         assert self.crop_box is None or self.training, "crop_box is not supported for scene graph model now"
         # forward like the original model
         out = super().get_outputs(camera)
-        # Sync CUDA to catch any async errors from the main render's
-        # project_gaussians / rasterize_gaussians before they propagate
-        # to submodel renders and produce misleading tracebacks.
-        if not self.training:
-            torch.cuda.synchronize()
         # Only run the extra rasterize passes for decomp losses during training
         # after densification ends. Running them during eval or during active
         # densification causes gsplat illegal-memory-access in
